@@ -1,0 +1,158 @@
+# naïve/unadjusted estimator ----------------------------------------------
+unadjusted_estimator <- function(data) {
+  # unadjusted
+  n = nrow(data)
+  est_unadj = data %$% {
+    mean(Y[A == 1]) - mean(Y[A == 0])
+  }
+  se_unadj = data %$% {
+    sqrt(2*(var(Y[A == 1]) + var(Y[A == 0])) / n)
+  }
+  return(tibble(
+    Estimate = est_unadj,
+    `Std. Error` = se_unadj
+  ))
+}
+
+
+# linear estimator --------------------------------------------------------
+linear_estimator <- function(data){
+  # linear
+  linear_fit <- estimatr::lm_robust(Y ~ ., data)
+  est_linear = linear_fit$coefficients[['A']]
+  se_linear = linear_fit$std.error[['A']]
+  return(tibble(
+    Estimate = est_linear,
+    `Std. Error` = se_linear
+  ))
+}
+
+
+# tmle efficient estimator ------------------------------------------------
+tmle_estimator <- function(
+    data,
+    ...
+){
+  n = nrow(data)
+  
+  # true g
+  prop = rep(0.5, n)
+  
+  # Q is already in data$mua - this is assumed 
+  
+  # get clever covariate
+  H = (data$A)/(prop) - (!data$A)/(1 - prop)
+  
+  target_fit = 
+    glm(
+      Y ~ -1 + H + offset(muA),
+      data = data.table(Y = data$Y, muA = data$mua, H=H)
+    )
+  
+  eps = coef(target_fit)
+  
+  updated_mu0 <- data$mu0 - eps*1/(1-prop)
+  updated_mu1 <- data$mu1 + eps*1/prop
+  
+  data %<>%
+    mutate(mu0=updated_mu0, 
+           mu1=updated_mu1)
+  
+  data %<>% 
+    mutate(Y_hat = ifelse(A==1, mu1, mu0))
+  
+  estimate = data %$% mean(mu1 - mu0)
+  IC <- data %$% {(Y - Y_hat)*H +
+      mu1 - mu0 - estimate}
+  
+  variance = var(IC)
+  return(tibble(
+    Estimate = estimate,
+    `Std. Error` = sqrt(variance/n)
+  ))
+}
+
+
+
+
+## LM for within trial 
+
+# marginal effect as the rate ratio
+RR <- function(psi_1, psi_0) {
+  psi_1 - psi_0
+}
+
+# derivatives of marginal effect 
+dRR_1 <- function(psi_0) {
+  1
+}
+
+dRR_0 <- function(psi_1, psi_0) {
+  -1
+}
+
+
+mean_IF_1 <- function(A, Y, mu1, pi, psi_1) {
+  (A/pi * (Y - mu1) + (mu1 - psi_1))
+}
+
+mean_IF_0 <- function(A, Y, mu0, pi, psi_0) {
+  ((1 - A)/(1 - pi) * (Y - mu0) + (mu0 - psi_0))
+}
+
+
+marginaleffect_IF <- function(data, pi, psi_1, psi_0) {
+  data %$% {
+    dRR_1(psi_0)*mean_IF_1(A, Y, m1, pi, psi_1) + dRR_0(psi_1, psi_0)*mean_IF_0(A, Y, m0, pi, psi_0)
+  }
+}
+
+
+# GLM plug-in estimator --------------------------------------------------------
+lm_within_trial <- function(data) {
+  #browser()
+  # glm fitting 
+  
+  data %<>% dplyr::mutate(Adot = case_when(A == 0 ~ -1, T ~ A)) 
+  
+  glm_fit <- lm(Y ~ Adot + mua -1, data = data)
+  # estimate of counterfactual mean functions 
+  data %<>% 
+    mutate(m1 = predict(glm_fit, type = "response", newdata = data %>% mutate(Adot = 1, mua = mu1)),
+           m0 = predict(glm_fit, type = "response", newdata = data %>% mutate(Adot = -1, mua = mu0)))
+  
+  # estimate of counterfactual means
+  psi_1 = data %$% {
+    mean(m1)
+  }
+  psi_0 = data %$% {
+    mean(m0)
+  }
+  
+  # Determine the influence curve 
+  IC <- marginaleffect_IF(data, pi = 1/2, psi_1, psi_0)
+  variance = var(IC)
+  
+  return(tibble(
+    Estimate = RR(psi_1, psi_0),
+    `Std. Error` = sqrt(variance/nrow(data))
+  ))
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
