@@ -1,0 +1,432 @@
+# -------------------------------------------------------------------------------------------
+# Purpose: Plots for results 
+#
+# Dependencies: 
+#
+# Output: 
+#
+# -------------------------------------------------------------------------------------------
+
+# load libraries and dependencies -----------------------------------------------------
+set.seed(34264524)
+
+library(tidymodels)
+library(magrittr)
+library(tidyverse)
+library(furrr)
+library(caret)
+library(ggplot2)
+library(cowplot)
+library(RColorBrewer)
+library(ggpubr)
+library(xtable)
+
+source("statprog/within-trial-prog/dpg_wtp.R") # to define zeta as in the dpg.R file
+
+# Load datasets -----------------------------------------------------------------------
+db <- NNaccess::nnaccess(project = "students", trial = "ehfd_phd", instance = "current")
+
+data_constant <- db$output_datasets("data_constant_wtp", ext = "rds")
+data_het <- db$output_datasets("data_het_wtp", ext = "rds")
+data_obs_shift <- db$output_datasets("data_obs_shift_wtp", ext = "rds")
+data_unobs_shift <- db$output_datasets("data_unobs_shift_wtp", ext = "rds")
+
+# Vary both loading
+inc <- c(50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
+         170, 180, 190, 200, 225, 250, 275, 300, 325, 350, 375, 400)
+
+data_vary_both <- db$output_datasets(paste0("data_vary_both_", inc[1]), ext = "rds")
+
+for (i in 2:length(inc)) {
+  data_vary_both <- rbind(data_vary_both,
+                          db$output_datasets(paste0("data_vary_both_", inc[i]), ext = "rds") )
+}
+
+
+# -------------------------------------------------------------------------------------------
+# Determining the true rate ratio in the two scenarios
+# -------------------------------------------------------------------------------------------
+
+# Constant treatment effect means log(mu1) = zeta + log(mu0) = zeta + eta0 implying
+# RR = E[mu1]/E[mu0] = E[exp(zeta + eta0)]/E[exp(eta0)] = E[exp(zeta)exp(eta0)]/E[exp(eta0)] = exp(zeta)
+
+truth_constant <- zeta
+
+# For the heterogeneous treatment effect scenario the true RR should be found
+# by using a large sample and using the law of large numbers since RR = E[mu1]/E[mu0]
+n <- 6820000
+outcome_dgp(dgp_string = 'heterogeneous')
+dat <- dgp(n,
+           p = 7,
+           shift_W1 = 0,
+           shift_U = 0)
+
+RR_old <- postcard::rctglm(formula = Y ~ A,
+                 exposure_indicator = A,
+                 exposure_prob = 1/2,
+                 data = dat,
+                 family = "gaussian",
+                 estimand_fun = "ate",
+                 verbose = 0,
+                 cv_variance = FALSE)$estimand$Estimate
+norm_diff <- 1
+
+# Set up loop to increase data points
+while (norm_diff > 0.0001) {
+  n <- n + 10000
+  dat_new <- dgp(n,
+                 p = 7,
+                 shift_W1 = 0,
+                 shift_U = 0)
+  
+  # Fit the unadjusted estimator
+  RR_new <- postcard::rctglm(formula = Y ~ A,
+                   exposure_indicator = A,
+                   exposure_prob = 1/2,
+                   data = dat_new,
+                   family = "gaussian",
+                   estimand_fun = "ate",
+                   verbose = 0,
+                   cv_variance = FALSE)$estimand$Estimate
+  
+  # Compute norm difference between old and new coefficients
+  norm_diff <- sqrt(sum((RR_new - RR_old)^2))
+  
+  # update old coefficients
+  RR_old <- RR_new
+}
+
+list <- list(coefficients = RR_old, n = n)
+
+truth_het <- list$coefficients
+
+# -------------------------------------------------------------------------------------------
+# Defining a function for finding the results
+# -------------------------------------------------------------------------------------------
+
+
+res <- function(results, truth = truth_het, alpha = 0.05) {
+  results %>%
+    summarize(
+      est_eff = mean(Estimate),
+      emp_se = sd(Estimate),
+      bias = mean(Estimate - truth),
+      #bias_thing = mean((Estimate - truth)/emp_se),
+      mean_est_se = mean(`Std. Error`),
+      rmse = sqrt(mean((Estimate - truth) ^ 2)),
+      power = mean(2*(1 - pnorm(abs((Estimate) / `Std. Error`))) < alpha),
+      coverage = mean(((qnorm(alpha/2) * `Std. Error` + Estimate) < truth) &
+                        (truth < (-qnorm(alpha/2) * `Std. Error` + Estimate)))
+      
+    )
+}
+
+# above .1 then bias affecting the coverage  
+# Define the number of simulations 
+N <- 250
+
+# -------------------------------------------------------------------------------------------
+# Table with all four scenarios including:
+# - Scenario
+# - method for analysing data
+# - True rate ratio
+# - Empirical standard error
+# - Mean estimated standard error
+# - RMSE
+# - Power
+# - Coverage
+# -------------------------------------------------------------------------------------------
+results <- rbind(data_het %>% mutate(scenario = 'het'), 
+                 data_obs_shift %>% mutate(scenario = 'obs_shift'),
+                 data_unobs_shift %>% mutate(scenario = 'unobs_shift'))
+
+tab <- results %>% group_by(scenario, estr, prog, shift_W1, shift_U) %>% res()
+
+tab %<>% rbind(data_constant %>%
+                 mutate(scenario = 'constant') %>% 
+                 group_by(scenario, estr, prog, shift_W1, shift_U) %>% 
+                 res(truth = truth_constant))
+
+tab <- tab %>%
+  mutate(scenario = case_when(
+    scenario == "het" ~ "Heterogeneous",
+    scenario == "constant" ~ "Constant",
+    scenario == "obs_shift" ~ "Observable shift",
+    scenario == "unobs_shift" ~ "Unobservable shift"
+  )) %>%
+  mutate(estr = case_when(
+    estr == "linear" & prog == "fit" ~ "Linear historical prognostic score",
+    estr == "linear" & prog == "fit_in_trial" ~ "Linear within-trial prognostic score",
+    estr == "TMLE" & prog == "none" ~ "TMLE",
+    estr == "linear" & prog == "oracle" ~ "Linear oracle prognostic score",
+    estr == "unadjusted" & prog == "none" ~ "Unadjusted",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(shift = shift_W1 + shift_U) %>%
+  group_by(scenario) %>%
+  dplyr::select(-prog, -shift_W1, -shift_U) %>%  # Removing the 'estr' and 'prog' columns
+  dplyr::select(scenario, estr, shift, est_eff, bias, everything()) %>% 
+  arrange(scenario, shift, match(estr, c("Unadjusted", "GLM", "GLM with non-informative prognostic score", "GLM with Super Learner prognostic score", "GLM with oracle prognostic score")))  # Reordering the dataframe based on 'estr_prog
+
+print(xtable(tab), include.rownames = FALSE)
+
+
+# -------------------------------------------------------------------------------------------
+# performance diff scenarios 
+# -------------------------------------------------------------------------------------------
+
+results <- rbind(
+  data_constant %>% mutate(scenario = 'constant'),
+  data_het %>% mutate(scenario = 'het'), 
+  data_obs_shift %>% filter(shift_W1 == -3) %>% mutate(scenario = 'obs_shift_small'),
+  data_obs_shift %>% filter(shift_W1 == -5) %>% mutate(scenario = 'obs_shift_large'),
+  data_unobs_shift %>% filter(shift_U == 0.5) %>% mutate(scenario = 'unobs_shift_small'),
+  data_unobs_shift %>% filter(shift_U == 1) %>% mutate(scenario = 'unobs_shift_large')
+) %>% mutate(estimator = case_when(
+  estr == "unadjusted" ~ "unadjusted",
+  estr == "linear" & prog == "fit" ~ "linear_w/prog",
+  estr == "linear" & prog == "fit_in_trial" ~ "linear_w/within_trial_prog",
+  estr == "tmle" & prog == "none" ~ "TMLE",
+  estr == "linear" & prog == "oracle" ~ "linear_w/oracle"
+))
+
+tab <- results %>% group_by(scenario, estimator, estr, prog, shift_W1, shift_U) %>% res()
+
+tab$estimator <- factor(tab$estimator, levels = c(
+  'unadjusted',
+  'linear_w/prog',
+  'linear_w/within_trial_prog',
+  'TMLE',
+  'linear_w/oracle'
+))
+
+tab$scenario <- factor(tab$scenario, levels = c(
+  'constant',
+  'het',
+  'obs_shift_small',
+  'obs_shift_large',
+  'unobs_shift_small',
+  'unobs_shift_large'
+))
+
+custom_labels <- c(
+  "unadjusted" = "Unadjusted",
+  "linear_w/prog" = "Linear historical prognostic score",
+  "linear_w/within_trial_prog" = "Linear within-trial prognostic score",
+  "TMLE" = "TMLE", 
+  "linear_w/oracle" = "Linear oracle prognostic score"
+)
+
+custom_colors <- c(
+  "unadjusted" = "#FD8D3C",
+  "linear_w/prog" = "#6BAED6",
+  "linear_w/within_trial_prog" = "#08519C",
+  "TMLE" = "#DD3497", 
+  "linear_w/oracle" = "#31A354"
+)
+
+# Create the plot
+p <- ggplot(tab, aes(x = estimator, y = mean_est_se, fill = estimator)) +
+  geom_point(aes(color = estimator), size = 3, position = position_dodge(width = .75)) +
+  geom_point(aes(y = emp_se, color = estimator), size = 2, shape = 8, position = position_dodge(width = .75)) +
+  facet_grid(. ~ factor(scenario), labeller = as_labeller(c(
+    `constant` = "Additive",
+    `het` = "Heterogeneous",
+    `obs_shift_small` = "Observed shift small",
+    `obs_shift_large` = "Observed shift large",
+    `unobs_shift_small` = "Unobserved shift small",
+    `unobs_shift_large` = "Unobserved shift large"
+  ))) +
+  theme(
+    axis.text.x = element_blank(), 
+    axis.ticks.x = element_blank(),  # Remove x-axis ticks
+    panel.grid.major = element_line(color = "grey95"),  # Adjust grid lines
+    panel.background = element_rect(fill = "white"),  # Adjust panel background
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    legend.position = "bottom",  # Adjust legend position
+    legend.title = element_blank(),  # Adjust legend title size
+    legend.background = element_rect(color = NA, fill = NA),
+    legend.text = element_text(size = 8),  # Adjust legend text size
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")  # Title formatting
+  ) +
+  labs(
+    x = "Estimator", 
+    y = "Standard error estimates", 
+    title = "Standard Error Estimates by Scenario"
+  ) +
+  scale_color_manual(values = custom_colors, labels = custom_labels) +  # Custom colors for points
+  scale_fill_manual(values = custom_colors, labels = custom_labels) 
+
+# Display the plot
+print(p)
+
+db$exportOutput(p, "wtp_perf_dif_scen", Format = "pdf", FgHeight = 14, FgWidth = 25)
+db$exportOutput(p, "wtp_perf_dif_scen", Format = "jpeg", FgHeight = 14, FgWidth = 25)
+# -------------------------------------------------------------------------------------------
+# Plot n_both change
+# -------------------------------------------------------------------------------------------
+
+# Custom labels and colors
+custom_labels <- c(
+  "unadjusted" = "Unadjusted",
+  "GLM" = "GLM",
+  "GLM_w/rand_prog" = "GLM with non-informative prognostic score",
+  "GLM_w/prog" = "GLM with Super Learner prognostic score",
+  "GLM_w/oracle" = "GLM with oracle prognostic score"
+)
+
+custom_colors <- c(
+  "unadjusted" = "#FD8D3C",
+  "GLM" = "#DD3497",
+  "GLM_w/rand_prog" = "Light Sky Blue",
+  "GLM_w/prog" = "#4292C6",
+  "GLM_w/oracle" = "#31A354"
+)
+
+
+tab <- data_vary_both %>% 
+  mutate(estimator = case_when(
+    estr == "unadjusted" ~ "unadjusted",
+    estr == "glm" & prog == "none" ~ "GLM",
+    estr == "glm" & prog == "fit random" ~ "GLM_w/rand_prog",
+    estr == "glm" & prog == "fit" ~ "GLM_w/prog",
+    estr == "glm" & prog == "oracle" ~ "GLM_w/oracle"
+  )) %>% 
+  group_by(n_trial, estimator, estr, prog) %>% 
+  res()
+
+# Ensure the correct ordering of the factor levels
+tab$estimator <- factor(tab$estimator, levels = c(
+  'unadjusted',
+  'GLM',
+  'GLM_w/rand_prog',
+  'GLM_w/prog',
+  'GLM_w/oracle'  # Ensure this is the last level
+))
+
+
+# Add vertical lines for sample size at 90% power
+ss_het <- ss_het %>% 
+  mutate(estimator = case_when(
+    estr == "unadjusted" & prog == "none" ~ "unadjusted",
+    estr == "glm" & prog == "none" ~ "GLM",
+    estr == "glm" & prog == "fit random" ~ "GLM_w/rand_prog",
+    estr == "glm" & prog == "fit" ~ "GLM_w/prog",
+    estr == "glm" & prog == "oracle" ~ "GLM_w/oracle"
+  ))
+
+# Ceiling the est_eff values
+ss_het$est_eff <- ceiling(ss_het$est_eff)
+
+# Adjust the positions for the annotations
+ss_het$y_pos <- ifelse(ss_het$estimator == "GLM_w/prog", 0.25, 
+                       ifelse(ss_het$estimator == "GLM_w/oracle", 0.22, 0.22))
+
+ss_het$x_pos <- ss_het$est_eff - 2  # Move to the left
+
+# -------------------------------------------------------------------------------------------
+# Power Plot
+# -------------------------------------------------------------------------------------------
+
+p.pwr <- tab %>%
+  ggplot(aes(x = n_trial, y = power, color = estimator)) +
+  geom_line() +  # Removed linetype aesthetic
+  xlab("n") +
+  ylab("Empirically estimated power") +
+  labs(color = "") +
+  theme_minimal() +
+  scale_y_continuous(breaks = c(.2, .4, .6, .8, 1),
+                     labels = function(x){paste0(x*100, "%")}) +
+  coord_cartesian(xlim = c(50, 300), ylim = c(.2, 1)) +
+  scale_color_manual(values = custom_colors, labels = custom_labels) +
+  theme(
+    legend.position = "bottom",  # Place legend at the bottom
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8),
+    legend.background = element_blank(),
+    legend.key = element_blank()
+  ) +
+  geom_hline(yintercept = 0.9, linetype = "dashed", color = "black") +  # Add horizontal dashed line at 90% power
+  geom_segment(data = ss_het, aes(x = est_eff, xend = est_eff, y = 0, yend = 0.9), 
+               linetype = "solid", color = custom_colors[as.character(ss_het$estimator)], show.legend = FALSE) +
+  geom_text(data = ss_het, aes(x = x_pos, y = y_pos, label = est_eff), 
+            color = custom_colors[as.character(ss_het$estimator)], vjust = 1.5, hjust = 1, size = 3, show.legend = FALSE)
+
+# -------------------------------------------------------------------------------------------
+# Coverage Plot
+# -------------------------------------------------------------------------------------------
+
+p.cov <- tab %>%
+  ggplot(aes(x = n_trial, y = coverage, color = estimator)) +
+  geom_line() +
+  xlab("n") +
+  ylab("Empirically estimated coverage") +
+  labs(color = "") +
+  theme_minimal() +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  scale_y_continuous(breaks = c(.7, .75, .8, .85, .9, .95, 1), labels = function(x){paste0(x*100, "%")}) +
+  scale_color_manual(values = custom_colors, labels = custom_labels) +
+  theme(
+    legend.position = "bottom",  # Place legend at the bottom
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8),
+    legend.background = element_blank(),
+    legend.key = element_blank()
+  )
+
+# -------------------------------------------------------------------------------------------
+# Combined Power and Coverage Plot
+# -------------------------------------------------------------------------------------------
+
+# Extract the legend from one of the plots
+legend <- get_legend(p.pwr)
+
+# Combine the plots without legends
+plot_row <- plot_grid(
+  p.pwr + theme(legend.position = "none"), 
+  p.cov + theme(legend.position = "none"),
+  labels = c('A', 'B'), label_size = 20, nrow = 1,
+  label_x = c(0, 0.01), label_y = c(1.05, 1.05)
+)
+
+# Add the title
+title <- ggdraw() + 
+  draw_label(
+    "Empirical power and coverage with increasing sample size",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    plot.margin = margin(0, 0, 0, 7)
+  )
+
+# Combine title, plot row, and legend
+combined_plot <- plot_grid(
+  title, plot_row, legend,
+  ncol = 1,
+  rel_heights = c(0.2, 1, 0.1)
+)
+
+# Display the combined plot
+print(combined_plot)
+
+
+
+db$exportOutput(combined_plot, "GLM_power_cov", Format = "pdf", FgHeight = 18, FgWidth = 29)
+db$exportOutput(combined_plot, "GLM_power_cov", Format = "jpeg", FgHeight = 18, FgWidth = 29)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
